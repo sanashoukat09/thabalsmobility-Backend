@@ -14,6 +14,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000", 
+        "https://c8x32160-3000.inc1.devtunnels.ms", 
+        "https://driver-filter-app.vercel.app",
         "https://thabalsmobility-frontend-peen.vercel.app"  
     ],
     allow_methods=["*"],
