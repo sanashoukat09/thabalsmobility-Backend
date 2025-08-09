@@ -13,15 +13,11 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000", 
-        "https://c8x32160-3000.inc1.devtunnels.ms", 
-        "https://driver-filter-app.vercel.app",
-        "https://thabalsmobility-frontend-peen.vercel.app"  # Add your actual frontend domain here
-    ],
+    allow_origins=["*"],  # allow all origins - beware security implications
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 
 @app.get("/")
