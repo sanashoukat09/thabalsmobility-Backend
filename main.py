@@ -1,258 +1,350 @@
 import os
 import pandas as pd
-from fastapi import FastAPI, File, UploadFile, Form
+import time
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, status, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
-from typing import Optional
+from typing import Optional, List, Dict
 import unicodedata
+import json
+import requests
+import math
+import random
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
-# Initialize FastAPI app
 app = FastAPI()
 
-# Configure CORS middleware to allow cross-origin requests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000"],
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
 
-# Root endpoint to check if backend is running
-@app.get("/")
-def read_root():
-    return {"message": "Backend is running."}
+# --- Configuration ---
+# JWT
+SECRET_KEY = "your-secret-key-1234567890"  # Replace with a secure key in production
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
-# Endpoint to filter driver data from an uploaded Excel file
-@app.post("/filter-driver")
-async def filter_driver(
+# Geospatial
+BASE_LOCATION_LATITUDE = 51.25881
+BASE_LOCATION_LONGITUDE = 6.39868
+RADIUS_KM = 10
+MIN_RADIUS_KM = 2
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Mock user database
+USERS = {
+    "admin": {"username": "admin", "password": pwd_context.hash("securepassword123")}
+}
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# --- Utility Functions ---
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    """Creates a JWT access token."""
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+def _generate_random_location_in_radius(base_lat, base_lon, radius_km, min_radius_km=2):
+
+    R = 6371
+    base_lat_rad = math.radians(base_lat)
+    base_lon_rad = math.radians(base_lon)
+    distance_km = random.uniform(min_radius_km, radius_km)
+    angle = random.uniform(0, 2 * math.pi)
+    new_lat_rad = math.asin(math.sin(base_lat_rad) * math.cos(distance_km / R) +
+                           math.cos(base_lat_rad) * math.sin(distance_km / R) * math.cos(angle))
+    new_lon_rad = base_lon_rad + math.atan2(math.sin(angle) * math.sin(distance_km / R) * math.cos(base_lat_rad),
+                                           math.cos(distance_km / R) - math.sin(base_lat_rad) * math.sin(new_lat_rad))
+    new_lat = math.degrees(new_lat_rad)
+    new_lon = math.degrees(new_lon_rad)
+    return round(new_lat, 6), round(new_lon, 6)
+
+def reverse_geocode(lat, lon):
+    """
+    Reverse-geocodes coordinates to a human-readable address using Nominatim (OpenStreetMap).
+    """
+    url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json"
+    headers = {"User-Agent": "Thabals_Mobility (contact@example.com)"}  # Replace with your app name and email
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("display_name", "GEOCODE_ERROR: No address found")
+    except requests.exceptions.RequestException as e:
+        return f"NETWORK_ERROR: {e}"
+
+# --- Utility Functions ---
+
+def _apply_geospatial_logic(df, filters_list):
+    """
+    Applies the geospatial logic to the DataFrame, updating locations for the first ride of the day and after breaks.
+    """
+    # Use English column names (as renamed in the endpoint)
+    pickup_col = "pickup_location"
+    geo_col = "geocoded_location"
+    
+    # Ensure these columns exist, otherwise add them
+    if geo_col not in df.columns:
+        df[geo_col] = None
+    if pickup_col not in df.columns:
+        df[pickup_col] = None
+
+    # Create full datetime objects directly on the DataFrame
+    df["ride_start_dt"] = pd.to_datetime(
+        df["date"].astype(str) + " " + df["ride_start"].dt.time.astype(str), errors="coerce"
+    )
+    df["ride_end_dt"] = pd.to_datetime(
+        df["date"].astype(str) + " " + df["ride_end"].dt.time.astype(str), errors="coerce"
+    )
+
+    df.dropna(subset=["ride_start_dt", "ride_end_dt"], inplace=True)
+    if df.empty:
+        print("No valid data after datetime parsing.")
+        return df
+
+    indices_to_update = set()
+    df_sorted = df.sort_values(by=["date", "ride_start_dt"])
+
+    # Identify first ride of each day
+    first_rides = df_sorted.groupby("date")["ride_start_dt"].idxmin()
+    indices_to_update.update(first_rides)
+    print(f"First rides of the day indices: {first_rides.tolist()}")
+
+    # Identify first ride after break
+    for filter_data in filters_list:
+        if filter_data.get("add_break"):
+            try:
+                filter_date = pd.to_datetime(filter_data["filter_date"]).date()
+                break_end = pd.to_datetime(filter_data["break_end"])
+                sub_df = df_sorted[
+                    (df_sorted["date"] == filter_date)
+                    & (df_sorted["ride_start_dt"] > break_end)
+                ]
+                if not sub_df.empty:
+                    first_after_break = sub_df["ride_start_dt"].idxmin()
+                    indices_to_update.add(first_after_break)
+                    print(f"First ride after break on {filter_date}: index {first_after_break}")
+            except (KeyError, ValueError) as e:
+                print(f"Error processing break filter: {e}")
+                continue
+
+    # Update coordinates and addresses for identified rides
+    for idx in sorted(indices_to_update):
+        # Generate new coordinates from base location
+        new_lat, new_lon = _generate_random_location_in_radius(
+            BASE_LOCATION_LATITUDE, BASE_LOCATION_LONGITUDE, RADIUS_KM, MIN_RADIUS_KM
+        )
+
+        # Respect Nominatim rate limit (1 request per second)
+        time.sleep(1)
+
+        # Reverse geocode the new coordinates
+        address = reverse_geocode(new_lat, new_lon)
+
+        # Update the DataFrame
+        print(f"Original geo: {df.at[idx, geo_col]}, pickup: {df.at[idx, pickup_col]}")
+        df.at[idx, geo_col] = f"{new_lat:.6f} {new_lon:.6f}"
+        df.at[idx, pickup_col] = address if not address.startswith(("GEOCODE_ERROR", "NETWORK_ERROR")) else "GEOCODING_FAILED"
+        print(f"Updated index {idx}: Coordinates={new_lat}, {new_lon}, Address={address}")
+
+    # Clean up the temporary datetime columns before returning
+    df.drop(columns=["ride_start_dt", "ride_end_dt"], errors='ignore', inplace=True)
+
+    return df
+
+# --- Dependency ---
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    """Validates the JWT token and returns the current user."""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None or username not in USERS:
+            raise credentials_exception
+        return username
+    except JWTError:
+        raise credentials_exception
+
+# --- API Endpoints ---
+@app.post("/token")
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = USERS.get(form_data.username)
+    if not user or not pwd_context.verify(form_data.password, user["password"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(data={"sub": form_data.username}, expires_delta=access_token_expires)
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.get("/check-auth")
+async def check_auth(current_user: str = Depends(get_current_user)):
+    return {"message": "Authenticated", "username": current_user}
+
+@app.post("/filter-driver-batch")
+async def filter_driver_batch(
     file: UploadFile = File(...),
     driver_name: str = Form(...),
-    add_break: bool = Form(False),
-    give_off: bool = Form(False),
-    break_start: Optional[str] = Form(None),
-    break_end: Optional[str] = Form(None),
-    off_date: Optional[str] = Form(None),
+    filters: str = Form(...),
+    current_user: str = Depends(get_current_user),
 ):
     try:
-        # Validate uploaded file size (max 10 MB)
-        if file.size > 10 * 1024 * 1024:
+        contents = await file.read()
+        if len(contents) > 10 * 1024 * 1024:
             return JSONResponse(status_code=400, content={"error": "File size exceeds 10 MB limit."})
 
-        # Read Excel file into a pandas DataFrame
-        contents = await file.read()
         df = pd.read_excel(BytesIO(contents))
+        filters_list = json.loads(filters)
 
-        # Store original column names and create a copy for processing with normalized names
-        original_columns = df.columns.tolist()
-        df_proc = df.copy()
-        normalized_columns = [col.strip().lower() for col in original_columns]
-        df_proc.columns = normalized_columns
-
-        print("? Uploaded Columns:", df_proc.columns.tolist())
-        print(f"? Initial row count: {len(df_proc)}")
-
-        # Define mapping of German column names to internal names for processing
+        # Mapping to English for processing
         column_mapping = {
             "datum der fahrt": "date",
             "fahrername": "driver_name",
             "uhrzeit des fahrtbeginns": "ride_start",
             "uhrzeit des fahrtendes": "ride_end",
-            "abholort": "pickup_location"
+            "abholort": "pickup_location",
+            "standort des fahrzeugs bei auftragsuebermittlung": "geocoded_location",
+            "abholzeit": "pickup_time",
         }
+        
+        # Create a reverse mapping for the final output
+        reverse_column_mapping = {v: k for k, v in column_mapping.items()}
+        
+        df_proc = df.copy()
+        
+        # Normalize and rename columns for internal processing
+        normalized_columns_map = {
+            col: column_mapping.get(col.strip().lower(), col) for col in df_proc.columns
+        }
+        df_proc.rename(columns=normalized_columns_map, inplace=True)
+        
+        # Add geocoded_location if it doesn't exist
+        if "geocoded_location" not in df_proc.columns:
+            df_proc["geocoded_location"] = None
 
-        # Rename columns in processing DataFrame based on column_mapping
-        for original, renamed in column_mapping.items():
-            for col in df_proc.columns:
-                if col.strip().lower() == original.strip().lower():
-                    df_proc.rename(columns={col: renamed}, inplace=True)
-
-        # Check for required columns in the processing DataFrame
-        required_columns = {"driver_name", "ride_start", "ride_end", "date"}
+        required_columns = {"driver_name", "ride_start", "ride_end", "date", "pickup_location", "geocoded_location"}
         missing_columns = required_columns - set(df_proc.columns)
         if missing_columns:
             return JSONResponse(
                 status_code=400,
                 content={"error": f"Excel file missing required columns: {', '.join(missing_columns)}"}
             )
-
-        # Get unique driver names for validation
-        unique_drivers = df_proc["driver_name"].astype(str).str.lower().str.strip().unique().tolist()
-        print(f"? Unique Fahrername values: {unique_drivers}")
-
-        # Define supported datetime formats for parsing
-        datetime_formats = [
-            "%Y-%m-%d %H:%M:%S.%f",
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%d",
-            "%H:%M:%S.%f",
-            "%H:%M:%S",
-            "%d.%m.%Y %H:%M:%S.%f",
-            "%d/%m/%Y %H:%M:%S.%f",
-            "%d.%m.%Y %H:%M:%S",
-            "%d/%m/%Y %H:%M:%S",
-            "%Y-%m-%d %H:%M",
-            "%d.%m.%Y %H:%M",
-            "%d/%m/%Y %H:%M",
-            "%d.%m.%Y",
-            "%d/%m/%Y"
-        ]
-
-        # Parse ride_start and ride_end columns into datetime format
+        
+        # Data type conversion and cleaning
         for col in ["ride_start", "ride_end"]:
-            for fmt in datetime_formats:
-                df_proc[col] = pd.to_datetime(df_proc[col], format=fmt, errors="coerce")
-                if not df_proc[col].isna().all():
-                    break
-            if df_proc[col].isna().all():
-                print(f"?? All {col} values failed to parse with formats: {datetime_formats}")
-
-        # Parse date column into date format
-        df_proc["date"] = pd.to_datetime(df_proc["date"], format="%Y-%m-%d", errors="coerce").dt.date
-
-        # Parse optional datetime column if present
-        if "datetime" in df_proc.columns:
-            for fmt in datetime_formats:
-                df_proc["datetime"] = pd.to_datetime(df_proc["datetime"], format=fmt, errors="coerce")
-                if not df_proc["datetime"].isna().all():
-                    break
-            if df_proc["datetime"].isna().all():
-                print(f"?? All datetime (Datum/Uhrzeit) values failed to parse with formats: {datetime_formats}")
-
-        # Remove rows with missing or invalid essential data
-        invalid_rows = df_proc[["ride_start", "ride_end", "driver_name", "date"]].isna().any(axis=1)
-        print(f"?? Rows with invalid datetimes: {invalid_rows.sum()}")
-        if invalid_rows.any():
-            print("?? Invalid rows sample:", df_proc[invalid_rows][["driver_name", "ride_start", "ride_end", "date"]].head().to_dict())
+            df_proc[col] = pd.to_datetime(df_proc[col], errors="coerce", format=None) 
+        df_proc["date"] = pd.to_datetime(df_proc["date"], errors="coerce").dt.date
         df_proc.dropna(subset=["ride_start", "ride_end", "driver_name", "date"], inplace=True)
-        print(f"? Rows after datetime parsing: {len(df_proc)}")
-
-        # Check if DataFrame is empty after parsing
+        
         if df_proc.empty:
-            return JSONResponse(status_code=404, content={"error": "No valid data after parsing datetimes. Ensure Fahrername, Datum der Fahrt, ride_start, and ride_end have correct formats (e.g., YYYY-MM-DD for dates, HH:MM:SS.FFF for times)."})
+            return JSONResponse(status_code=404, content={"error": "No valid data after parsing datetimes."})
 
-        # Filter rows by normalized driver name
+        # Apply driver name filter
         driver_name_clean = unicodedata.normalize("NFKD", driver_name.lower().strip())
         df_proc["driver_name_normalized"] = df_proc["driver_name"].astype(str).str.lower().str.strip().apply(lambda x: unicodedata.normalize("NFKD", x))
-        df_proc = df_proc[df_proc["driver_name_normalized"] == driver_name_clean]
+        final_df = df_proc[df_proc["driver_name_normalized"] == driver_name_clean].drop(columns=["driver_name_normalized"])
+
+        if final_df.empty:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"No data found for driver '{driver_name}'."}
+            )
         
-        df_proc.drop(columns=["driver_name_normalized"], inplace=True)
-        print(f"? Rows after driver filter ('{driver_name_clean}'): {len(df_proc)}")
-        print(f"? Sample filtered rows: {df_proc[['driver_name', 'date', 'ride_start', 'ride_end']].head().to_dict()}")
-        if df_proc.empty:
-            return JSONResponse(
-                status_code=404,
-                content={"error": f"No data found for driver '{driver_name}'. Check spelling, case, whitespace, or special characters in Fahrername. Available drivers: {unique_drivers}."}
-            )
-
-        # Apply off-day filter if specified
-        if give_off and off_date:
+        # Apply break and off-day filters first
+        for filter_data in filters_list:
+            filter_date_str = filter_data.get("filter_date")
+            if not filter_date_str:
+                continue
+            
             try:
-                off_date = pd.to_datetime(off_date, format="%Y-%m-%d").date()
-                pre_off_rows = len(df_proc)
-                df_proc = df_proc[df_proc["date"] != off_date]
-                print(f"? Removed {pre_off_rows - len(df_proc)} rows for off day on {off_date}, remaining: {len(df_proc)}")
-            except ValueError as e:
-                return JSONResponse(status_code=400, content={"error": f"Invalid off date format. Use YYYY-MM-DD. Error: {e}"})
-
-        # Apply break time filter if specified
-        if add_break and break_start and break_end:
-            try:
-                break_formats = ["%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"]
-                break_start_dt = None
-                break_end_dt = None
-                for fmt in break_formats:
-                    try:
-                        break_start_dt = pd.to_datetime(break_start, format=fmt, errors="raise")
-                        break_end_dt = pd.to_datetime(break_end, format=fmt, errors="raise")
-                        break
-                    except ValueError:
+                filter_date_dt = pd.to_datetime(filter_date_str, format="%Y-%m-%d").date()
+                if filter_data.get("give_off"):
+                    final_df = final_df[final_df["date"] != filter_date_dt]
+                elif filter_data.get("add_break"):
+                    break_start_str = filter_data.get("break_start")
+                    break_end_str = filter_data.get("break_end")
+                    if not break_start_str or not break_end_str:
                         continue
-                if break_start_dt is None or break_end_dt is None:
-                    raise ValueError("Invalid break time format. Use YYYY-MM-DD HH:MM:SS.FFF.")
-                if (break_end_dt - break_start_dt).total_seconds() <= 0:
-                    return JSONResponse(status_code=400, content={"error": "Break end time must be after start time."})
-                pre_break_rows = len(df_proc)
-                df_proc = df_proc[
-                    ~(
-                        (df_proc["date"] == break_start_dt.date()) &
-                        (df_proc["ride_start"] <= break_end_dt) &
-                        (df_proc["ride_end"] >= break_start_dt)
+                    
+                    break_start_dt = pd.to_datetime(break_start_str)
+                    break_end_dt = pd.to_datetime(break_end_str)
+                    
+                    if (break_end_dt - break_start_dt).total_seconds() <= 0:
+                        continue
+                    
+                    is_overlapping_break = (
+                        (final_df["date"] == filter_date_dt) &
+                        (final_df["ride_start"] <= break_end_dt) & 
+                        (final_df["ride_end"] >= break_start_dt)
                     )
-                ]
-                print(f"? Removed {pre_break_rows - len(df_proc)} rows for break on {break_start_dt.date()} from {break_start_dt.time()} to {break_end_dt.time()}, remaining: {len(df_proc)}")
-            except ValueError as e:
-                return JSONResponse(status_code=400, content={"error": f"Invalid break time format. Use YYYY-MM-DD HH:MM:SS.FFF (24-hour). Error: {e}"})
-
-        # Check if DataFrame is empty after filtering
-        if df_proc.empty:
+                    final_df = final_df[~is_overlapping_break]
+            
+            except Exception as e:
+                print(f"Error processing filter for date {filter_date_str}: {e}")
+                continue
+        
+        if final_df.empty:
             return JSONResponse(
                 status_code=404,
-                content={"error": f"No data remains for driver '{driver_name}' after filtering. Check off date or break times against Datum der Fahrt and ride times, or verify '{driver_name}' has valid data."}
+                content={"error": f"No data remains for driver '{driver_name}' after filtering."}
             )
 
-        # Calculate hours worked per ride
-        df_proc["hours_worked"] = (df_proc["ride_end"] - df_proc["ride_start"]).dt.total_seconds() / 3600
+        # Apply the new geospatial logic
+        final_df = _apply_geospatial_logic(final_df.copy(), filters_list)
 
-        # Update pickup location for the first ride of each day per driver
-        if "pickup_location" in df_proc.columns:
-            for (driver, date), group in df_proc.groupby(["driver_name", "date"]):
-                if not group.empty:
-                    earliest_ride_idx = group["ride_start"].idxmin()
-                    df_proc.loc[earliest_ride_idx, "pickup_location"] = "Gladbacher Strasse 189, 41747 Viersen, Germany"
-            print(f"? Updated Abholort for first rides: {df_proc[df_proc['pickup_location'] == 'Gladbacher Strasse 189, 41747 Viersen, Germany'].shape[0]} rows updated")
-        else:
-            print("?? Abholort column not found in input Excel. Skipping pickup location update.")
+        # Recalculate hours worked and other final processing
+        final_df["hours_worked"] = (final_df["ride_end"] - final_df["ride_start"]).dt.total_seconds() / 3600
 
-        # Prepare final DataFrame for export
-        filtered = df_proc.copy()
-        print(f"? Rows in filtered DataFrame: {len(filtered)}")
-        print(f"? Output columns: {filtered.columns.tolist()}")
-
-        # Format datetime columns to string with .000 milliseconds
+        # Format dates back to string format for Excel output
+        filtered = final_df.copy()
         for col in ["ride_start", "ride_end"]:
             filtered[col] = filtered[col].dt.strftime("%Y-%m-%d %H:%M:%S.000")
-
-        # Format date column to YYYY-MM-DD string
         if "date" in filtered.columns:
             filtered["date"] = pd.to_datetime(filtered["date"]).dt.strftime("%Y-%m-%d")
 
-
-        # Restore original column names for output
-        reverse_column_mapping = {v: k for k, v in column_mapping.items()}
+        # Rename columns back to original German headers
         final_columns = []
         for col in filtered.columns:
-            col_lower = col.lower()
-            if col_lower in reverse_column_mapping:
-                mapped_german_name = reverse_column_mapping[col_lower]
-                original_col_name = None
-                for orig_col in original_columns:
-                    if orig_col.strip().lower() == mapped_german_name:
-                        original_col_name = orig_col
-                        break
-                final_columns.append(original_col_name if original_col_name else mapped_german_name)
-            else:
-                final_columns.append(col)
+            final_columns.append(reverse_column_mapping.get(col, col))
         filtered.columns = final_columns
 
-        # Export filtered DataFrame to Excel with custom formatting
+        # --- Create Excel Response ---
         output = BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             filtered.to_excel(writer, index=False, sheet_name="Sheet1")
             workbook = writer.book
             worksheet = writer.sheets["Sheet1"]
 
-            # Set column widths and formats based on column names
             for idx, col in enumerate(filtered.columns, 1):
                 column_letter = get_column_letter(idx)
                 col_lower = col.lower()
-                if col_lower == "datum der fahrt":
+                if col_lower == reverse_column_mapping.get("date").lower():
                     worksheet.column_dimensions[column_letter].width = 15
                     for cell in worksheet[column_letter][1:]:
                         cell.number_format = "YYYY-MM-DD"
-                elif col_lower in ["uhrzeit des fahrtbeginns", "uhrzeit des fahrtendes"]:
+                elif col_lower in [reverse_column_mapping.get("ride_start").lower(), reverse_column_mapping.get("ride_end").lower()]:
                     worksheet.column_dimensions[column_letter].width = 25
                     for cell in worksheet[column_letter][1:]:
                         cell.number_format = "YYYY-MM-DD HH:MM:SS.000"
@@ -260,22 +352,20 @@ async def filter_driver(
                     worksheet.column_dimensions[column_letter].width = 12
                     for cell in worksheet[column_letter][1:]:
                         cell.number_format = "0.00"
-                elif col_lower == "abholort":
+                elif col_lower == reverse_column_mapping.get("pickup_location").lower():
                     worksheet.column_dimensions[column_letter].width = 40
-                    for cell in worksheet[column_letter][1:]:
-                        cell.number_format = "@"
+                elif col_lower == reverse_column_mapping.get("geocoded_location").lower():
+                    worksheet.column_dimensions[column_letter].width = 30
                 else:
                     worksheet.column_dimensions[column_letter].width = 20
 
         output.seek(0)
-
-        # Return Excel file as streaming response
         return StreamingResponse(
             output,
             media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            headers={"Content-Disposition": f"attachment; filename=filtered_{driver_name_clean}.xlsx"}
+            headers={"Content-Disposition": f"attachment; filename=filtered_combined_{driver_name_clean}.xlsx"}
         )
 
     except Exception as e:
-        print(f"? Error: {e}")
+        print(f"Error during batch filtering: {e}")
         return JSONResponse(status_code=500, content={"error": f"Server error: {str(e)}"})
