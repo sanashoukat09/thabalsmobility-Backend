@@ -132,7 +132,6 @@ def _apply_geospatial_logic(df, filters_list):
 
     df.dropna(subset=["ride_start_dt", "ride_end_dt"], inplace=True)
     if df.empty:
-        print("No valid data after datetime parsing.")
         return df
 
     indices_to_update = set()
@@ -141,8 +140,6 @@ def _apply_geospatial_logic(df, filters_list):
     # Identify first ride of each day
     first_rides = df_sorted.groupby("date")["ride_start_dt"].idxmin()
     indices_to_update.update(first_rides)
-    print(f"First rides of the day indices: {first_rides.tolist()}")
-
     # Identify first ride after break
     for filter_data in filters_list:
         if filter_data.get("add_break"):
@@ -156,9 +153,7 @@ def _apply_geospatial_logic(df, filters_list):
                 if not sub_df.empty:
                     first_after_break = sub_df["ride_start_dt"].idxmin()
                     indices_to_update.add(first_after_break)
-                    print(f"First ride after break on {filter_date}: index {first_after_break}")
             except (KeyError, ValueError) as e:
-                print(f"Error processing break filter: {e}")
                 continue
 
     # Update coordinates and addresses for identified rides
@@ -175,10 +170,8 @@ def _apply_geospatial_logic(df, filters_list):
         address = reverse_geocode(new_lat, new_lon)
 
         # Update the DataFrame
-        print(f"Original geo: {df.at[idx, geo_col]}, pickup: {df.at[idx, pickup_col]}")
         df.at[idx, geo_col] = f"{new_lat:.6f} {new_lon:.6f}"
         df.at[idx, pickup_col] = address if not address.startswith(("GEOCODE_ERROR", "NETWORK_ERROR")) else "GEOCODING_FAILED"
-        print(f"Updated index {idx}: Coordinates={new_lat}, {new_lon}, Address={address}")
 
     # Clean up the temporary datetime columns before returning
     df.drop(columns=["ride_start_dt", "ride_end_dt"], errors='ignore', inplace=True)
@@ -316,7 +309,6 @@ async def filter_driver_batch(
                     final_df = final_df[~is_overlapping_break]
             
             except Exception as e:
-                print(f"Error processing filter for date {filter_date_str}: {e}")
                 continue
         
         if final_df.empty:
@@ -381,5 +373,4 @@ async def filter_driver_batch(
         )
 
     except Exception as e:
-        print(f"Error during batch filtering: {e}")
         return JSONResponse(status_code=500, content={"error": f"Server error: {str(e)}"})
