@@ -33,6 +33,8 @@ app.add_middleware(
 SECRET_KEY = "your-secret-key-1234567890"  # Replace with a secure key in production
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
+GOOGLE_API_KEY = "AIzaSyCdmDUU7PtIOVc3hrdszc5gaxURG_2daNQ"  # Replace with your real API key
+
 
 # Geospatial
 BASE_LOCATION_LATITUDE = 51.25881
@@ -64,31 +66,43 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
 
 
 def _generate_random_location_in_radius(base_lat, base_lon, radius_km, min_radius_km=2):
-
-    R = 6371
+    """
+    Generates random coordinates within a given radius (and above a min radius) from the base point.
+    """
+    R = 6371  # Earth radius in km
     base_lat_rad = math.radians(base_lat)
     base_lon_rad = math.radians(base_lon)
+
+    # Random distance within the given range
     distance_km = random.uniform(min_radius_km, radius_km)
+    # Random bearing
     angle = random.uniform(0, 2 * math.pi)
+
     new_lat_rad = math.asin(math.sin(base_lat_rad) * math.cos(distance_km / R) +
                            math.cos(base_lat_rad) * math.sin(distance_km / R) * math.cos(angle))
     new_lon_rad = base_lon_rad + math.atan2(math.sin(angle) * math.sin(distance_km / R) * math.cos(base_lat_rad),
                                            math.cos(distance_km / R) - math.sin(base_lat_rad) * math.sin(new_lat_rad))
-    new_lat = math.degrees(new_lat_rad)
-    new_lon = math.degrees(new_lon_rad)
-    return round(new_lat, 6), round(new_lon, 6)
+
+    return round(math.degrees(new_lat_rad), 6), round(math.degrees(new_lon_rad), 6)
 
 def reverse_geocode(lat, lon):
     """
-    Reverse-geocodes coordinates to a human-readable address using Nominatim (OpenStreetMap).
+    Reverse-geocodes coordinates to a human-readable address using Google Maps API.
     """
-    url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json"
-    headers = {"User-Agent": "Thabals_Mobility (contact@example.com)"}  # Replace with your app name and email
+    url = f"https://maps.googleapis.com/maps/api/geocode/json?latlng={lat},{lon}&key={GOOGLE_API_KEY}"
     try:
-        response = requests.get(url, headers=headers, timeout=5)
+        response = requests.get(url, timeout=5)
         response.raise_for_status()
         data = response.json()
-        return data.get("display_name", "GEOCODE_ERROR: No address found")
+
+        if data.get("status") == "OK" and data.get("results"):
+            return data["results"][0].get("formatted_address", "No address found")
+        elif data.get("status") == "OVER_QUERY_LIMIT":
+            return "GEOCODE_ERROR: API quota exceeded"
+        elif data.get("status") == "REQUEST_DENIED":
+            return f"GEOCODE_ERROR: {data.get('error_message', 'Request denied')}"
+        else:
+            return f"GEOCODE_ERROR: {data.get('status', 'Unknown error')}"
     except requests.exceptions.RequestException as e:
         return f"NETWORK_ERROR: {e}"
 
