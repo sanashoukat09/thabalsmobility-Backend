@@ -108,21 +108,98 @@ def reverse_geocode(lat, lon):
 
 # --- Utility Functions ---
 
+def geocode_address(address):
+    """
+    Forward geocode an address to (lat, lon, formatted_address) using Google Geocoding API.
+    Returns (lat, lon, formatted_address) or (None, None, error_msg).
+    """
+    if not address or not isinstance(address, str) or address.strip() == "":
+        return None, None, "INVALID_ADDRESS"
+    try:
+        addr_enc = requests.utils.requote_uri(address)
+        url = f"https://maps.googleapis.com/maps/api/geocode/json?address={addr_enc}&key={GOOGLE_API_KEY}"
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        status = data.get("status")
+        if status == "OK" and data.get("results"):
+            res0 = data["results"][0]
+            loc = res0["geometry"]["location"]
+            formatted = res0.get("formatted_address", address)
+            return float(loc["lat"]), float(loc["lng"]), formatted
+        else:
+            return None, None, f"GEOCODE_ERROR: {status}"
+    except requests.exceptions.RequestException as e:
+        return None, None, f"NETWORK_ERROR: {e}"
+    except Exception as e:
+        return None, None, f"GEOCODE_EXCEPTION: {e}"
+
+def travel_distance(lat1, lon1, lat2, lon2):
+    """Return shortest driving distance in kilometers using Google Maps Distance Matrix API."""
+    import requests
+    url = (
+        f"https://maps.googleapis.com/maps/api/distancematrix/json?"
+        f"origins={lat1},{lon1}&destinations={lat2},{lon2}"
+        f"&mode=driving&units=metric&key={GOOGLE_API_KEY}"
+    )
+
+    try:
+        response = requests.get(url, timeout=10)
+        data = response.json()
+
+        if (
+            data.get("rows")
+            and data["rows"][0].get("elements")
+            and data["rows"][0]["elements"][0].get("status") == "OK"
+        ):
+            # distance in meters → convert to km
+            meters = data["rows"][0]["elements"][0]["distance"]["value"]
+            return meters / 1000.0
+        else:
+            return None  # could not get driving distance
+
+    except Exception as e:
+        print(f"Error fetching driving distance: {e}")
+        return None
+
+
 def _apply_geospatial_logic(df, filters_list):
     """
-    Applies the geospatial logic to the DataFrame, updating locations for the first ride of the day and after breaks.
+    Update pickup_location & geocoded_location for first rides and first-after-break rides,
+    compute Kilometer between pickup and Zielort (address in Excel), and Fahrpreis = Kilometer * 1.5.
     """
-    # Use English column names (as renamed in the endpoint)
     pickup_col = "pickup_location"
     geo_col = "geocoded_location"
+    ziel_col_name = None
+
+    # Detect Zielort column explicitly (case-insensitive)
+    for c in df.columns:
+        if str(c).strip().lower() == "zielort":
+            ziel_col_name = c
+            break
+    if not ziel_col_name:
+        # fallback: any column containing 'ziel'
+        for c in df.columns:
+            if "ziel" in str(c).lower():
+                ziel_col_name = c
+                break
+
+    if ziel_col_name:
+        print(f"Using Ziel column: '{ziel_col_name}'")
+    else:
+        print("No Zielort column found. Distance will not be calculated.")
     
-    # Ensure these columns exist, otherwise add them
+    # Ensure necessary columns exist
     if geo_col not in df.columns:
         df[geo_col] = None
     if pickup_col not in df.columns:
         df[pickup_col] = None
+    if "Kilometer" not in df.columns:
+        df["Kilometer"] = None
+    if "Fahrpreis" not in df.columns:
+        df["Fahrpreis"] = None
 
-    # Create full datetime objects directly on the DataFrame
+    # Prepare datetimes (same as before)
     df["ride_start_dt"] = pd.to_datetime(
         df["date"].astype(str) + " " + df["ride_start"].dt.time.astype(str), errors="coerce"
     )
@@ -132,50 +209,92 @@ def _apply_geospatial_logic(df, filters_list):
 
     df.dropna(subset=["ride_start_dt", "ride_end_dt"], inplace=True)
     if df.empty:
+        print("No valid data after datetime parsing.")
         return df
 
     indices_to_update = set()
     df_sorted = df.sort_values(by=["date", "ride_start_dt"])
 
-    # Identify first ride of each day
+    # first ride each day
     first_rides = df_sorted.groupby("date")["ride_start_dt"].idxmin()
     indices_to_update.update(first_rides)
-    # Identify first ride after break
+    print(f"First rides indices: {first_rides.tolist()}")
+
+    # first ride after break(s)
     for filter_data in filters_list:
         if filter_data.get("add_break"):
             try:
                 filter_date = pd.to_datetime(filter_data["filter_date"]).date()
                 break_end = pd.to_datetime(filter_data["break_end"])
-                sub_df = df_sorted[
-                    (df_sorted["date"] == filter_date)
-                    & (df_sorted["ride_start_dt"] > break_end)
-                ]
+                sub_df = df_sorted[(df_sorted["date"] == filter_date) & (df_sorted["ride_start_dt"] > break_end)]
                 if not sub_df.empty:
                     first_after_break = sub_df["ride_start_dt"].idxmin()
                     indices_to_update.add(first_after_break)
-            except (KeyError, ValueError) as e:
+                    print(f"First after break on {filter_date}: index {first_after_break}")
+            except Exception as e:
+                print(f"Error processing break filter: {e}")
                 continue
 
-    # Update coordinates and addresses for identified rides
+    # Process each identified index
     for idx in sorted(indices_to_update):
-        # Generate new coordinates from base location
+        # generate pickup coords
         new_lat, new_lon = _generate_random_location_in_radius(
             BASE_LOCATION_LATITUDE, BASE_LOCATION_LONGITUDE, RADIUS_KM, MIN_RADIUS_KM
         )
 
-        # Respect Nominatim rate limit (1 request per second)
+        # Respect rate limit before reverse geocoding
         time.sleep(1)
+        pickup_address = reverse_geocode(new_lat, new_lon)
 
-        # Reverse geocode the new coordinates
-        address = reverse_geocode(new_lat, new_lon)
-
-        # Update the DataFrame
         df.at[idx, geo_col] = f"{new_lat:.6f} {new_lon:.6f}"
-        df.at[idx, pickup_col] = address if not address.startswith(("GEOCODE_ERROR", "NETWORK_ERROR")) else "GEOCODING_FAILED"
+        df.at[idx, pickup_col] = pickup_address if not pickup_address.startswith(("GEOCODE_ERROR", "NETWORK_ERROR")) else "GEOCODING_FAILED"
 
-    # Clean up the temporary datetime columns before returning
+        # Default values
+        distance_km = None
+
+        # If Zielort exists, geocode Zielort (address) to lat/lon
+        if ziel_col_name:
+            ziel_raw = df.at[idx, ziel_col_name]
+            if isinstance(ziel_raw, str) and ziel_raw.strip() != "":
+                # forward geocode Zielort address
+                time.sleep(1)
+                zlat, zlon, zfmt = geocode_address(ziel_raw)
+                if zlat is not None and zlon is not None:
+                    print(f"Ziel coords: {zlat:.6f}, {zlon:.6f}")
+                    distance_km = travel_distance(new_lat, new_lon, zlat, zlon)
+                    df.at[idx, "Kilometer"] = round(distance_km, 3)
+                    df.at[idx, "Fahrpreis"] = round(distance_km * 1.5, 2)
+                else:
+                    df.at[idx, "Kilometer"] = None
+                    df.at[idx, "Fahrpreis"] = None
+                    zfmt = zfmt  # error message
+            else:
+                # Zielort empty/invalid
+                df.at[idx, "Kilometer"] = None
+                df.at[idx, "Fahrpreis"] = None
+                zfmt = "Zielort missing or invalid"
+        else:
+            zfmt = "No Zielort column detected"
+
+        # Print debugging info
+        print("---- Geospatial update ----")
+        print(f"Index: {idx}")
+        print(f"Pickup (generated): {pickup_address}")
+        print(f"Pickup coords: {new_lat:.6f}, {new_lon:.6f}")
+        if ziel_col_name:
+            print(f"Ziel raw value: {df.at[idx, ziel_col_name]}")
+            print(f"Ziel geocode result: {zfmt}")
+            if distance_km is not None:
+                print(f"Ziel coords found, Distance (km): {distance_km:.3f}")
+                print(f"Fahrpreis: {round(distance_km * 1.5, 2)}")
+            else:
+                print("Distance: COULD NOT BE CALCULATED")
+        else:
+            print("No Zielort column to compare.")
+        print("---------------------------")
+
+    # cleanup
     df.drop(columns=["ride_start_dt", "ride_end_dt"], errors='ignore', inplace=True)
-
     return df
 
 # --- Dependency ---
